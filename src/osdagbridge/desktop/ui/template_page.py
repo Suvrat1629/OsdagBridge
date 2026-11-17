@@ -351,6 +351,8 @@ class CustomWindow(QWidget):
             QSizePolicy.Expanding, QSizePolicy.Expanding
         )
         self.cad_log_splitter.addWidget(self.cad_comp_widget)
+        self.cad_comp_widget.set_label_edit_hooks(self._cad_label_edit_allowed, self._cad_label_value)
+        self.cad_comp_widget.label_value_edited.connect(self._apply_cad_label_edit)
 
         # from osdagbridge.desktop.ui.cad_3d import CAD3DWindow
         # 3D CAD placeholder (mutually exclusive with dual view + plots)
@@ -446,6 +448,46 @@ class CustomWindow(QWidget):
 
         return self._additional_inputs_dialog
     
+    def _cad_label_edit_allowed(self, key) -> bool:
+        dock = getattr(self, "input_dock", None)
+        if dock is None or dock.is_locked:
+            return False
+        return self.input_dict.get(key) is not None or key in (KEY_SPAN, KEY_CARRIAGEWAY_WIDTH)
+
+    def _cad_label_value(self, key) -> str:
+        value = self.input_dict.get(key)
+        try:
+            return f"{float(value):g}"
+        except (TypeError, ValueError):
+            return ""
+
+    def _apply_cad_label_edit(self, key: str, text: str):
+        """Push a value typed on a CAD label through the same path as typing it in the input field."""
+        is_basic = key in (KEY_SPAN, KEY_CARRIAGEWAY_WIDTH)
+        dialog = None
+        if is_basic:
+            trial = dict(self.input_dict)
+            validate = self.input_dock.validator.validate_basic_inputs
+        else:
+            dialog = self._get_additional_inputs()
+            dialog.set_input_dictionary(self.input_dict)
+            trial = dict(dialog.working_input_dict)
+            validate = dialog.validator.validate_additional_inputs
+        trial[key] = text
+        error = validate(key, trial)
+        if error is not None:
+            CustomMessageBox(title="Input Error", text=error[1], dialogType=MessageBoxType.Warning).exec()
+            return
+
+        box = self.input_dock._w(key) if is_basic else dialog.findChild(QLineEdit, key)
+        box.setText(text)
+        box.editingFinished.emit()
+        if not is_basic:
+            dialog.default_input_dict.update(dialog.working_input_dict)
+            dialog.is_modified = False
+            dialog._update_additional_input_cad()
+            self.cad_comp_widget.update_from_osdag_inputs(self.input_dict)
+
     def update_2d_cad(self, cad_state: dict):
         """
         This Function is the connector to the Signal from Additional Inputs when clicked on Save Button
