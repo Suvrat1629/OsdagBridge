@@ -22,11 +22,14 @@ from osdagbridge.core.bridge_types.plate_girder.plot_generator import (
     build_figure_bmd,
     build_figure_deflection,
     build_figure_grillage,
+    build_figure_transverse,
     _add_node_number_labels,
     _add_element_number_labels,
     FORCE_MAP,
     DISP_MAP,
 )
+
+from osdagbridge.core.utils.common import VALUE_TRANSVERSE_MEMBERS
 
 # Forces starting with "F" -> shear (SFD); starting with "M" -> moment (BMD)
 _SFD_KEYS  = {k for k in FORCE_MAP if k.startswith("F")}
@@ -174,6 +177,8 @@ class MplPlotWidget(QWidget):
         self._edge_dist = 0.0
         self._output_dock = None
         self._summary_data = {}
+
+        self._transverse_shown = False
 
         # Display States
         self._grillage_mode = False
@@ -518,6 +523,7 @@ class MplPlotWidget(QWidget):
         loadcase  = self._current_loadcase()
         force_key = self._current_force_key()
         sel_girder= self._current_member()
+        transverse = sel_girder == VALUE_TRANSVERSE_MEMBERS
 
         if not loadcase or not force_key:
             return
@@ -525,11 +531,12 @@ class MplPlotWidget(QWidget):
         ds = self._ds_all.sel(Loadcase=loadcase)
         
         old_elev, old_azim = None, None
-        if hasattr(self, '_fig') and self._fig and self._fig.axes:
+        if hasattr(self, '_fig') and self._fig and self._fig.axes and transverse == self._transverse_shown:
             old_ax = self._fig.axes[0]
             if hasattr(old_ax, 'elev'):
                 old_elev = old_ax.elev
                 old_azim = old_ax.azim
+        self._transverse_shown = transverse
 
         # NOW we can safely destroy the old plot
         plt.close(self._fig)
@@ -538,7 +545,12 @@ class MplPlotWidget(QWidget):
 
         # (Your existing if/elif/else block to build the new figures)
         eng_scale = self._eng_scale
-        if force_key in _SFD_KEYS:
+        if transverse:
+            self._fig, self._summary_data = build_figure_transverse(
+                ds, force_key, self._nodes, self._members,
+                edge_dist=self._edge_dist, eng_scale=eng_scale,
+            )
+        elif force_key in _SFD_KEYS:
             self._fig, self._summary_data = build_figure_sfd(
                 ds, force_key, self._nodes, self._members,
                 edge_dist=self._edge_dist, eng_scale=eng_scale,
@@ -716,6 +728,8 @@ class MplPlotWidget(QWidget):
                 old_azim = self._fig.axes[0].azim
             plt.close(self._fig)
             sel_girder = self._current_member()
+            if sel_girder == VALUE_TRANSVERSE_MEMBERS:
+                sel_girder = "All"
             self._fig = build_figure_grillage(self._nodes, self._members, edge_dist=self._edge_dist, selected_girder=sel_girder)
             self._attach_figure(self._fig)
             if self._fig.axes and old_elev is not None and old_azim is not None:

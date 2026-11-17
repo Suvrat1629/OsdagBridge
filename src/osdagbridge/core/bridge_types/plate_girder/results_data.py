@@ -14,9 +14,24 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import openseespy.opensees as ops
 
 from .results_data_post_processing import post_process, FORCE_KEEP, DISP_KEEP
+
+# Output-dock force keys -> (i, j) end components for a member running along the
+# bridge width. ospgrillage reports forces in global axes, so the quantity a user
+# means by "bending" or "axial" sits in a different component than for a girder.
+TRANSVERSE_FORCE_MAP = {
+    "Fx": ("Vz_i", "Vz_j"),
+    "Fy": ("Vy_i", "Vy_j"),
+    "Fz": ("Vx_i", "Vx_j"),
+    "Mx": ("Mz_i", "Mz_j"),
+    "My": ("My_i", "My_j"),
+    "Mz": ("Mx_i", "Mx_j"),
+}
+DISPLACEMENT_COMPONENT = {"Dx": "x", "Dy": "y", "Dz": "z"}
+_Z_TOL = 1e-3
 
 
 class LazyLoadcaseResults(Mapping):
@@ -355,6 +370,78 @@ def restructure_data(
     return data
 
 
+def classify_members(nodes: dict, members: dict) -> tuple[list, list]:
+    """Split element tags into (longitudinal, transverse).
+
+    Longitudinal elements keep a constant lateral position (same z and y at both ends);
+    everything else runs across the width.
+    """
+    longitudinal, transverse = [], []
+    for tag, (n1, n2) in members.items():
+        if n1 not in nodes or n2 not in nodes:
+            continue
+        if abs(nodes[n1][2] - nodes[n2][2]) < _Z_TOL and abs(nodes[n1][1] - nodes[n2][1]) < _Z_TOL:
+            longitudinal.append(tag)
+        else:
+            transverse.append(tag)
+    return longitudinal, transverse
+
+
+def transverse_chains(nodes: dict, members: dict) -> list[list[int]]:
+    """Group transverse elements into lines across the width, ordered along the span."""
+    _, tags = classify_members(nodes, members)
+    outgoing = {}
+    for tag in tags:
+        n1, n2 = members[tag]
+        if nodes[n1][2] > nodes[n2][2]:
+            n1, n2 = n2, n1
+        outgoing[n1] = (tag, n2)
+    heads = set(outgoing) - {end for _, end in outgoing.values()}
+
+    chains = []
+    for head in heads:
+        chain, node = [], head
+        while node in outgoing:
+            tag, node = outgoing[node]
+            chain.append(tag)
+        chains.append(chain)
+    chains.sort(key=lambda c: nodes[members[c[0]][0]][0])
+    return chains
+
+
+def extract_transverse_results(ds, key: str, nodes: dict, members: dict) -> list[dict]:
+    """Per-line values of one output-dock key for all transverse members.
+
+    ds is the results dataset already sliced to one load case. Forces are in kN / kNm,
+    displacements in mm. Returns one dict per line: name, node_ids, xs, zs, values.
+    """
+    def end_value(elem, comp):
+        return float(ds["forces"].sel(Element=elem, Component=comp).values) / 1000.0
+
+    lines = []
+    for number, chain in enumerate(transverse_chains(nodes, members), start=1):
+        node_ids = [members[e][0] for e in chain] + [members[chain[-1]][1]]
+        if key in DISPLACEMENT_COMPONENT:
+            comp = DISPLACEMENT_COMPONENT[key]
+            sign = -1.0 if comp in ("y", "z") else 1.0
+            values = [
+                sign * 1000.0 * float(ds["displacements"].sel(Node=n, Component=comp).values)
+                for n in node_ids
+            ]
+        else:
+            comp_i, comp_j = TRANSVERSE_FORCE_MAP[key]
+            values = [end_value(e, comp_i) for e in chain]
+            values.append(-end_value(chain[-1], comp_j))
+        lines.append({
+            "name": f"T{number}",
+            "node_ids": node_ids,
+            "xs": np.array([nodes[n][0] for n in node_ids]),
+            "zs": np.array([nodes[n][2] for n in node_ids]),
+            "values": np.array(values),
+        })
+    return lines
+
+
 def _build_full_data(model, edge_dist: float = 0.0, dataset=None, lazy: bool = False) -> dict:
     """
     Build the complete, un-filtered result data dict from the live model and
@@ -408,18 +495,7 @@ def _build_full_data(model, edge_dist: float = 0.0, dataset=None, lazy: bool = F
     disp_components = [str(
         c) for c in ds0["displacements"].coords["Component"].values] if "displacements" in ds0.data_vars else []
 
-    # Classify members: longitudinal = both nodes share same Z and same Y
-    _z_tol = 1e-3
-    longitudinal_members = []
-    transverse_members = []
-    for tag, (n1, n2) in members.items():
-        if n1 not in nodes or n2 not in nodes:
-            continue
-        if (abs(nodes[n1][2] - nodes[n2][2]) < _z_tol and
-                abs(nodes[n1][1] - nodes[n2][1]) < _z_tol):
-            longitudinal_members.append(tag)
-        else:
-            transverse_members.append(tag)
+    longitudinal_members, transverse_members = classify_members(nodes, members)
 
     data: dict = {
         "nodes": {str(k): list(v) for k, v in nodes.items()},

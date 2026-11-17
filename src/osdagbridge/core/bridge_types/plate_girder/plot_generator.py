@@ -12,6 +12,8 @@ import openseespy.opensees as ops
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from mpl_toolkits.mplot3d import proj3d
 from matplotlib.text import Annotation
+
+from .results_data import extract_transverse_results
 try:
     import mplcursors
     _MPLCURSORS = True
@@ -52,6 +54,9 @@ DISP_DISPLAY = {
 # View settings (elevation/azimuth for a near-front-elevation look)
 DEFAULT_ELEV = 10
 DEFAULT_AZIM = -90
+# Transverse members run across the width, so they are edge-on in the default view.
+TRANSVERSE_ELEV = 25
+TRANSVERSE_AZIM = -60
 
 
 def _value_plot_scale(eng_scale):
@@ -1559,6 +1564,104 @@ def figure_to_bytes(fig, fmt="png", dpi=150):
     buf.seek(0)
     plt.close(fig)
     return buf.read()
+
+# =============================================================================
+# TRANSVERSE MEMBERS PLOT
+# =============================================================================
+
+def build_figure_transverse(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0):
+    """Diagram of one force / displacement over all transverse members (end diaphragms and
+    intermediate cross members), drawn as a single component."""
+    v_scale = _value_plot_scale(eng_scale)
+    is_disp = force_key in DISP_MAP
+    is_force = force_key.startswith("F")
+    label = DISP_DISPLAY[force_key] if is_disp else FORCE_DISPLAY.get(force_key, force_key)
+    unit = "mm" if is_disp else ("kN" if is_force else "kNm")
+    sign = -1.0 if force_key.startswith("M") else 1.0   # positive moment plots downward, as in the BMD
+    line_color = "#6A1B9A" if is_disp else ("#1565C0" if is_force else "#C62828")
+    fill_color = "#CE93D8" if is_disp else ("#90CAF9" if is_force else "#EF9A9A")
+    extreme_color = "black"
+    muted_color = "#455A64"
+
+    lines = extract_transverse_results(ds, force_key, nodes, members)
+
+    fig = Figure(figsize=(14, 6), dpi=110, facecolor="white")
+    ax = fig.add_subplot(111, projection="3d", facecolor="white")
+
+    all_xs = [coord[0] for coord in nodes.values()]
+    all_zs = [coord[2] for coord in nodes.values()]
+    x_range = max(all_xs) - min(all_xs) or 1.0
+    z_range = max(all_zs) - min(all_zs) or 1.0
+    ax.set_xlim(min(all_xs) - 0.05 * x_range, max(all_xs) + 0.05 * x_range)
+    ax.set_ylim(min(all_zs) - 0.05 * z_range, max(all_zs) + 0.05 * z_range)
+
+    _add_grillage_background(
+        ax, nodes, members,
+        show_transverse=False,
+        include_edge_longitudinals=True,
+        include_end_transverse=False,
+        show_inner_nodes=False,
+    )
+
+    summary_data = {}
+    global_vmin = global_vmax = 0.0
+    if lines:
+        values = np.concatenate([line["values"] for line in lines])
+        summary_data["Transverse"] = {"max": float(values.max()), "min": float(values.min())}
+        peak_max = max(((line["values"].max(), k, int(line["values"].argmax())) for k, line in enumerate(lines)))
+        peak_min = min(((line["values"].min(), k, int(line["values"].argmin())) for k, line in enumerate(lines)))
+
+    for k, line in enumerate(lines):
+        xs, zs, vals = line["xs"], line["zs"], line["values"]
+        y_plot = sign * vals * v_scale
+        global_vmin = min(global_vmin, float(y_plot.min()))
+        global_vmax = max(global_vmax, float(y_plot.max()))
+
+        ax.plot_surface(
+            np.vstack([xs, xs]), np.vstack([zs, zs]), np.vstack([np.zeros_like(y_plot), y_plot]),
+            color=fill_color, alpha=0.25, linewidth=0, antialiased=False, zorder=2,
+        )
+        ax.plot(xs, zs, y_plot, color=line_color, linewidth=1.5, zorder=4)
+        ax.scatter(xs, zs, y_plot, color=line_color, s=14, zorder=5, depthshade=False)
+        ax.text(xs[0], zs[0] - z_range * 0.04, 0, line["name"], color="black", fontsize=9,
+                ha="center", va="center", zorder=50, gid="girder_labels")
+
+        for j in range(len(xs)):
+            is_peak = (k, j) in ((peak_max[1], peak_max[2]), (peak_min[1], peak_min[2]))
+            if is_peak or abs(vals[j]) <= 1e-4:
+                continue
+            ax.text(xs[j], zs[j], y_plot[j], f" {vals[j]:.3f} {unit}", color=muted_color, fontsize=7,
+                    ha="left", va="bottom" if j % 2 == 0 else "top", zorder=6, gid="all_vals",
+                    bbox=dict(boxstyle="round,pad=0.1", facecolor="white", alpha=0.7, edgecolor="none"))
+
+    if lines:
+        for (value, k, j), tag, align in ((peak_max, "max_line", "bottom"), (peak_min, "min_line", "top")):
+            line = lines[k]
+            y_peak = sign * value * v_scale
+            ax.plot([line["xs"][j]], [line["zs"][j]], [y_peak], marker="o", markersize=9, color=extreme_color,
+                    markeredgecolor="white", markeredgewidth=1.5, linestyle="None", zorder=10, gid=tag)
+            ax.text(line["xs"][j], line["zs"][j], y_peak, f" {value:.3f} {unit}", color=extreme_color,
+                    fontsize=7, fontweight="bold", ha="left", va=align, zorder=11, gid=tag,
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8, edgecolor="none"))
+
+    _add_supports(ax, nodes, members, edge_dist=edge_dist)
+    _add_node_number_labels(ax, nodes)
+    _add_element_number_labels(ax, nodes, members)
+    ax.set_xlabel("Span Length (m)", fontsize=10, labelpad=8)
+    ax.set_ylabel("Bridge Width (m)", fontsize=10, labelpad=8)
+    ax.set_zlabel(f"{label} ({unit})", fontsize=10, labelpad=8)
+    _set_value_axis_tick_formatter(ax, v_scale)
+    z_span = max(1e-9, max(0.0, global_vmax) - min(0.0, global_vmin))
+    pad = max(1e-6, 0.05 * z_span)
+    ax.set_zlim(min(0.0, global_vmin) - pad, max(0.0, global_vmax) + pad)
+    ax.set_box_aspect([x_range, z_range, (x_range * 0.30) * max(v_scale, 1e-6)])
+    ax.set_title(f"Transverse Members  —  {label} ({unit})", fontsize=12, fontweight="bold", pad=12)
+    fig._eng_scale = v_scale
+    ax.view_init(elev=TRANSVERSE_ELEV, azim=TRANSVERSE_AZIM)
+    _add_coordinate_triad(ax, nodes, eng_scale=v_scale)
+    ax.set_axis_off()
+    return fig, summary_data
+
 
 def _render_report_figure(fig, show_max: bool, show_min: bool):
     """Apply report annotations, set isometric view, save to PNG bytes, close figure.
