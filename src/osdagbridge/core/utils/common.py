@@ -43,6 +43,11 @@ TYPE_SEGMENT_TABLE  = "segment_table"
 TYPE_ADAPTIVE = "adaptive"
 TYPE_ALL_CUSTOM = "all_custom"   # combo [All, Custom] where Custom opens popup dialog
 
+# Additional Inputs: "Custom" selection and the objectName suffixes of a TYPE_MODE_LINE pair
+VALUE_CUSTOM = "Custom"
+SUFFIX_MODE_COMBO = ".mode"
+SUFFIX_VALUE_INPUT = ".value"
+
 # ========== Type of Fields End ==========================================================
 
 # Keys for inputs (consistent dot notation for object names)

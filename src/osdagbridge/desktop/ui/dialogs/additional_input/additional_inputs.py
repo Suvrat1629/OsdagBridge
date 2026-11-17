@@ -22,6 +22,12 @@ from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder.common_ui_builde
 from osdagbridge.core.bridge_types.plate_girder.ui_fields_additional_input import ADDITIONAL_INPUTS_SCHEMA
 from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder._load_combination_widget import LoadCombinationWidget
 from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder.common_ui_builder import AdaptiveWidget
+from osdagbridge.desktop.ui.dialogs.additional_input.custom_field_validation import find_empty_custom_fields
+
+MSG_EMPTY_CUSTOM_VALUE = "Error: The custom value for '{name}' cannot be empty."
+MSG_UNSAVED_CHANGES = "You have unsaved changes. Closing this window will discard them. Do you want to proceed?"
+BTN_DISCARD = "Discard"
+BTN_CANCEL = "Cancel"
 
 # =================================================================================
 #   MAIN IMPLEMENTATION
@@ -50,6 +56,9 @@ class AdditionalInputs(QDialog):
         self.working_input_dict = {}
         # Last confirmed-good spacing and girder count; restored if solver raises an error
         self._last_good_layout: dict = {}
+
+        self.is_modified = False
+        self._closing = False  # closeEvent -> QDialog.closeEvent -> reject(); avoids a second prompt
 
         # TO tract additional input is opened first time or not.
         # This is required for end connectors
@@ -503,10 +512,79 @@ class AdditionalInputs(QDialog):
         for tab_widget in self.findChildren(QTabWidget):
             if hasattr(tab_widget, "refresh_active_tab"):
                 tab_widget.refresh_active_tab()
+        QTimer.singleShot(0, self._clear_modified)
+
+    def _clear_modified(self):
+        self.is_modified = False
+
+    def _confirm_close(self) -> bool:  # on_close: asks Discard/Cancel when there are unsaved changes
+        if not self.is_modified:
+            return True
+        answer = CustomMessageBox(
+            title="Unsaved Changes",
+            text=MSG_UNSAVED_CHANGES,
+            buttons=[BTN_DISCARD, BTN_CANCEL],
+            dialogType=MessageBoxType.Warning,
+        ).exec()
+        if answer != BTN_DISCARD:
+            return False
+        self._discard_changes()
+        return True
+
+    def _discard_changes(self):  # on_close: restores widgets and working dict to the last saved state
+        combos = {c.objectName(): c.currentText() for c in self.findChildren(QComboBox) if c.objectName()}
+        self.working_input_dict = deepcopy(self.default_input_dict)
+        self.set_defaults()
+        # set_defaults blocks signals, so dependent fields need their on_change handler re-run
+        for tab_def in ADDITIONAL_INPUTS_SCHEMA:
+            self._rerun_changed_combo_handlers(tab_def["schema"], combos)
+        self.is_modified = False
+
+    def _rerun_changed_combo_handlers(self, node, previous_text: dict):  # utility: re-runs on_change for combos whose value was restored
+        if isinstance(node, dict):
+            handler_name = node.get("on_change")
+            combo_id = node.get("id")
+            if node.get("type") == TYPE_COMBOBOX and combo_id and handler_name:
+                combo = self.findChild(QComboBox, combo_id)
+                handler = getattr(self, handler_name, None)
+                if combo is not None and callable(handler) and combo.currentText() != previous_text.get(combo_id):
+                    try:
+                        handler(combo.currentText())
+                    except TypeError:  # handler takes no argument
+                        handler()
+            for value in node.values():
+                self._rerun_changed_combo_handlers(value, previous_text)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                self._rerun_changed_combo_handlers(item, previous_text)
+
+    def closeEvent(self, event):  # Qt event: X button / close()
+        if not self._confirm_close():
+            event.ignore()
+            return
+        self._closing = True
+        try:
+            super().closeEvent(event)
+        finally:
+            self._closing = False
+
+    def reject(self):  # Qt: Esc goes through the same guard
+        if self._closing or self._confirm_close():
+            super().reject()
 
     # ── Dialog Persistence ───────────────────────────────────────────────────────
 
     def _save_inputs(self):  # on_change: validates all tabs then commits working_input_dict and emits CAD update signal
+
+        empty_custom = find_empty_custom_fields(self)
+        if empty_custom:
+            CustomMessageBox(
+                title="Error",
+                text="\n".join(MSG_EMPTY_CUSTOM_VALUE.format(name=name) for name in empty_custom),
+                buttons=["OK"],
+                dialogType=MessageBoxType.Critical,
+            ).exec()
+            return
 
         # Flush the currently-displayed stiffener member's widgets before committing.
         # _save_stiffener_member_data otherwise only runs when switching *away* from a
@@ -517,6 +595,7 @@ class AdditionalInputs(QDialog):
             self._save_stiffener_member_data(combo.currentText().strip())
 
         self.default_input_dict.update(self.working_input_dict)
+        self.is_modified = False
         from osdagbridge.desktop.ui.docks.cad_cross_section import CrossSectionCADWidget
         cad = self.findChild(CrossSectionCADWidget, KEY_TS_CAD_PREVIEW)
         if cad:
@@ -598,6 +677,12 @@ class AdditionalInputs(QDialog):
         self._update_additional_input_cad()
 
     def _update_input_dict(self, key: str, value: str):  # utility: writes a value to working_input_dict, falling back to default if empty
+        previous = self.working_input_dict.get(key)
+        self._store_input_value(key, value)
+        if self.working_input_dict.get(key) != previous:
+            self.is_modified = True
+
+    def _store_input_value(self, key: str, value: str):  # utility: writes the value, falling back to default if empty
         if value is None or value == "":
             self.working_input_dict[key] = self.default_input_dict.get(key)
         else:
